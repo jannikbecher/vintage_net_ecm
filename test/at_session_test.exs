@@ -11,8 +11,81 @@ defmodule VintageNetECM.ATSessionTest do
   setup do
     pty = start_supervised!({PTY, []})
     channel = start_supervised!({Channel, tty: PTY.tty(pty), intermediate_responses: ["> "]})
-    assert :sys.get_state(channel).available
+    assert {:idle, _} = :sys.get_state(channel)
     %{pty: pty, channel: channel}
+  end
+
+  test "state transitions distinguish a lease from an unfinished exchange", %{
+    channel: channel,
+    pty: pty
+  } do
+    assert {:idle, %{session: nil}} = :sys.get_state(channel)
+
+    AT.session(channel, fn at ->
+      assert {:leased, %{session: %{owner: owner}}} = :sys.get_state(channel)
+      assert owner == self()
+      assert AT.send(at, "AT+X\r") == :ok
+      assert {:awaiting_response, _} = :sys.get_state(channel)
+      assert PTY.read(pty, 5) == "AT+X\r"
+      :ok = PTY.write(pty, "> ")
+      assert AT.receive(at) == {:ok, {:intermediate, "> "}}
+      assert {:awaiting_response, _} = :sys.get_state(channel)
+      assert AT.receive(at, timeout: 20) == {:error, :timeout}
+      assert {:awaiting_response, _} = :sys.get_state(channel)
+      assert AT.send(at, <<27>>) == :ok
+      assert PTY.read(pty, 1) == <<27>>
+      :ok = PTY.write(pty, "ERROR\r\n")
+      assert AT.receive(at) == {:ok, {:response, ["ERROR"]}}
+      assert {:leased, _} = :sys.get_state(channel)
+    end)
+
+    assert {:idle, %{session: nil}} = :sys.get_state(channel)
+  end
+
+  test "session expiry survives exchange state changes and release cancels the old timeout", %{
+    channel: channel,
+    pty: pty
+  } do
+    AT.session(
+      channel,
+      fn at ->
+        assert AT.send(at, "AT\r") == :ok
+        assert PTY.read(pty, 3) == "AT\r"
+        :ok = PTY.write(pty, "OK\r\n")
+        assert AT.receive(at) == {:ok, {:response, ["OK"]}}
+        # Leased -> awaiting_response -> leased must not cancel the lease timer.
+        Process.sleep(120)
+        assert {:idle, %{session: nil}} = :sys.get_state(channel)
+      end,
+      timeout: 100
+    )
+
+    AT.session(channel, fn _ -> :ok end, timeout: 20)
+
+    AT.session(
+      channel,
+      fn _ ->
+        Process.sleep(40)
+        assert {:leased, _} = :sys.get_state(channel)
+      end,
+      timeout: 1_000
+    )
+
+    assert {:idle, %{session: nil}} = :sys.get_state(channel)
+  end
+
+  test "an unavailable tty retries opening without creating a session", %{pty: pty} do
+    tty = Path.join(System.tmp_dir!(), "ecm-late-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm(tty) end)
+    :ok = stop_supervised(Channel)
+    channel = start_supervised!({Channel, tty: tty})
+    assert {:unavailable, %{session: nil}} = :sys.get_state(channel)
+    assert AT.session(channel, fn _ -> flunk("unavailable") end) == {:error, :tty_not_open}
+    File.ln_s!(PTY.tty(pty), tty)
+    # Exercise the retry with the real state timeout, without issuing recovery.
+    Process.sleep(5_100)
+    assert {:idle, %{session: nil}} = :sys.get_state(channel)
+    assert AT.session(channel, fn _ -> :opened end) == :opened
   end
 
   test "callback results, exceptions, PID ownership, stale handles and competing sessions", %{
@@ -91,7 +164,7 @@ defmodule VintageNetECM.ATSessionTest do
       assert PTY.read(pty, 3) == "AT\r"
       expired = %{at | deadline: System.monotonic_time(:millisecond) - 1}
       assert AT.receive(expired) == {:error, :timeout}
-      refute :sys.get_state(channel).blocked
+      refute elem(:sys.get_state(channel), 0) == :recovery_required
       assert AT.command(at, "AT") == {:error, :exchange_pending}
       assert PTY.write(pty, "OK\r\n") == :ok
       assert AT.receive(at) == {:ok, {:response, ["OK"]}}
@@ -156,7 +229,7 @@ defmodule VintageNetECM.ATSessionTest do
              {:error, :busy}
            ]
 
-    assert :sys.get_state(channel).blocked
+    assert elem(:sys.get_state(channel), 0) == :recovery_required
   end
 
   test "abandoned prompts and expired leases cannot reopen admission", %{
@@ -192,12 +265,13 @@ defmodule VintageNetECM.ATSessionTest do
         timeout: 20
       )
 
-      assert :sys.get_state(channel).blocked == pending
+      expected = if pending, do: :recovery_required, else: :idle
+      assert {^expected, %{session: nil}} = :sys.get_state(channel)
     end
   end
 
   test "UART process loss is fenced without killing the channel", %{channel: channel} do
-    uart = :sys.get_state(channel).uart
+    uart = elem(:sys.get_state(channel), 1).uart
     monitor = Process.monitor(uart)
     Process.exit(uart, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^uart, :killed}
@@ -208,7 +282,7 @@ defmodule VintageNetECM.ATSessionTest do
            ]
 
     assert Process.alive?(channel)
-    assert :sys.get_state(channel).blocked
+    assert elem(:sys.get_state(channel), 0) == :recovery_required
     assert Channel.recover(channel) == :ok
     assert AT.session(channel, fn _ -> :recovered end) == :recovered
   end
@@ -242,7 +316,7 @@ defmodule VintageNetECM.ATSessionTest do
       assert Channel.recover(channel) == {:error, :busy}
     end)
 
-    refute :sys.get_state(channel).blocked
+    refute elem(:sys.get_state(channel), 0) == :recovery_required
     assert {:error, reason} = start_supervised({Channel, tty: PTY.tty(pty)}, id: :duplicate)
     assert inspect(reason) =~ "already_open"
   end
@@ -302,7 +376,7 @@ defmodule VintageNetECM.ATSessionTest do
 
       assert AT.command(at, "AT", timeout: 100) == {:error, :timeout}
       Task.await(task)
-      refute :sys.get_state(channel).blocked
+      refute elem(:sys.get_state(channel), 0) == :recovery_required
       assert AT.command(at, "AT") == {:error, :exchange_pending}
       :ok = PTY.write(pty, "K\r\n")
       assert AT.receive(at) == {:ok, {:response, ["NO CARRIER", "OK"]}}
@@ -367,7 +441,7 @@ defmodule VintageNetECM.ATSessionTest do
 
   test "queued recovery cannot execute after its caller times out", %{channel: channel} do
     assert AT.session(channel, &AT.send(&1, "AT\r")) == :ok
-    uart = :sys.get_state(channel).uart
+    uart = elem(:sys.get_state(channel), 1).uart
     :ok = :sys.suspend(channel)
 
     try do
@@ -377,9 +451,7 @@ defmodule VintageNetECM.ATSessionTest do
       :sys.resume(channel)
     end
 
-    state = :sys.get_state(channel)
-    assert state.uart == uart
-    assert state.blocked
+    assert {:recovery_required, %{uart: ^uart}} = :sys.get_state(channel)
   end
 
   test "temporary unlinked channels stop when their owner exits", %{pty: pty} do
@@ -388,7 +460,7 @@ defmodule VintageNetECM.ATSessionTest do
 
     {owner, owner_monitor} =
       spawn_monitor(fn ->
-        {:ok, channel} = GenServer.start(Channel, tty: PTY.tty(pty), owner: self())
+        {:ok, channel} = Channel.start(tty: PTY.tty(pty), owner: self())
         send(parent, {:temporary_channel, channel})
 
         receive do
@@ -406,10 +478,23 @@ defmodule VintageNetECM.ATSessionTest do
   test "status diagnostics redact requests and payloads" do
     assert Channel.format_status(%{
              state: "private",
+             data: "private",
+             queue: ["private"],
+             postponed: ["private"],
+             timeouts: ["private"],
              message: "private",
              reason: "private",
              log: ["private"]
            }) ==
-             %{state: :redacted, message: :redacted, reason: :redacted, log: []}
+             %{
+               state: :redacted,
+               data: :redacted,
+               queue: :redacted,
+               postponed: :redacted,
+               timeouts: :redacted,
+               message: :redacted,
+               reason: :redacted,
+               log: []
+             }
   end
 end

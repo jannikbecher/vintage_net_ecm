@@ -10,20 +10,39 @@ defmodule VintageNetECM.AT.Channel do
   supervision tree, then use `VintageNetECM.AT.session/3` with its name or PID.
   Options are `:tty`, `:name`, `:speed` (115,200), and `:intermediate_responses` (`[]`).
   An optional `:owner` PID bounds the lifetime of a temporary, unlinked channel.
+  Managed channels use `:ifname` to publish `mobile.recovery_required` in VintageNet.
   Tty paths are claimed once per node. Do not use aliases for an already-owned tty.
 
-  Receive timeouts leave the exchange pending for the owner to finish or abort
-  within the session deadline. I/O failures and sessions ending with an
-  unfinished exchange fence the channel. After explicitly recovering
-  the modem, call `recover/1` to reopen the UART and discard stale input. Reopening
-  alone does not cancel a modem operation. Nothing retries uncertain writes.
-  Supervision restarts are not a modem recovery procedure.
+  The channel moves between `:unavailable`, `:idle`, `:leased`,
+  `:awaiting_response`, and `:recovery_required`. Receive timeouts leave the
+  exchange pending for the owner to finish or abort within the session deadline.
+  I/O failures and sessions ending with an unfinished exchange require recovery.
+
+  After explicitly recovering the modem, call `recover/1` to reopen the UART
+  and discard stale input. Reopening alone does not cancel a modem operation.
+  Nothing retries uncertain writes. Supervision restarts are not modem recovery.
   """
-  use GenServer
+  @behaviour :gen_statem
   alias VintageNetECM.AT
 
-  def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+  def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
+
+  def start_link(opts), do: start(:start_link, opts)
+
+  @doc false
+  def start(opts), do: start(:start, opts)
+
+  defp start(function, opts) do
+    case Keyword.get(opts, :name) do
+      nil ->
+        apply(:gen_statem, function, [__MODULE__, opts, []])
+
+      name when is_atom(name) ->
+        apply(:gen_statem, function, [{:local, name}, __MODULE__, opts, []])
+
+      name ->
+        apply(:gen_statem, function, [name, __MODULE__, opts, []])
+    end
   end
 
   @doc "Reopen a fenced channel only after the modem has been explicitly recovered."
@@ -52,11 +71,14 @@ defmodule VintageNetECM.AT.Channel do
   end
 
   defp call(channel, request, deadline) do
-    GenServer.call(channel, request, AT.remaining(deadline) + 1_000)
+    :gen_statem.call(channel, request, AT.remaining(deadline) + 1_000)
   catch
     :exit, {:noproc, _} -> {:error, :not_running}
     :exit, _ -> {:error, :outcome_unknown}
   end
+
+  @impl true
+  def callback_mode, do: [:handle_event_function, :state_enter]
 
   @impl true
   def init(opts) do
@@ -68,26 +90,24 @@ defmodule VintageNetECM.AT.Channel do
     with :ok <- AT.validate_intermediate_responses(markers),
          true <- is_integer(speed) and speed > 0,
          :ok <- claim_tty(tty) do
-      state = %{
+      data = %{
         tty: tty,
+        ifname: Keyword.get(opts, :ifname),
         speed: speed,
         markers: markers,
         uart: nil,
-        available: false,
-        blocked: false,
         owner_monitor: if(opts[:owner], do: Process.monitor(opts[:owner])),
         session: nil
       }
 
-      {:ok, state, {:continue, :open}}
+      {:ok, :unavailable, data, [{:next_event, :internal, :open}]}
     else
       false -> {:stop, :invalid_options}
       {:error, reason} -> {:stop, reason}
     end
   end
 
-  # A node-local OTP lock needs no application registry and is released on process
-  # exit, after terminate/2 closes the UART. Channel names remain caller-selected.
+  # Node-local tty ownership lasts until this process exits.
   defp claim_tty(tty) do
     if :global.set_lock({{__MODULE__, tty}, self()}, [node()], 0),
       do: :ok,
@@ -95,85 +115,99 @@ defmodule VintageNetECM.AT.Channel do
   end
 
   @impl true
-  def handle_continue(:open, state) do
-    case open_uart(state) do
-      {:ok, state} ->
-        {:noreply, state}
+  def handle_event(:enter, old_state, state, data) do
+    if old_state == state or state == :recovery_required or old_state == :recovery_required,
+      do: publish_recovery(data, state == :recovery_required)
 
-      {:error, _reason, state} ->
-        Process.send_after(self(), :open, 5_000)
-        {:noreply, state}
+    :keep_state_and_data
+  end
+
+  def handle_event(type, :open, :unavailable, data) when type in [:internal, :state_timeout] do
+    case open_uart(data) do
+      {:ok, data} -> {:next_state, :idle, data}
+      {:error, _, data} -> {:keep_state, data, [{:state_timeout, 5_000, :open}]}
     end
   end
 
-  @impl true
-  def handle_info(:open, %{available: false, blocked: false} = state),
-    do: {:noreply, state, {:continue, :open}}
+  def handle_event(:info, {:EXIT, uart, _}, _state, %{uart: uart} = data),
+    do: {:next_state, :recovery_required, %{data | uart: nil}}
 
-  def handle_info(:open, state), do: {:noreply, state}
+  # A UART deliberately stopped during recovery may report its exit later.
+  def handle_event(:info, {:EXIT, _, _}, _state, _data), do: :keep_state_and_data
 
-  def handle_info({:EXIT, uart, _reason}, %{uart: uart} = state),
-    do: {:noreply, %{state | uart: nil, available: false, blocked: true}}
+  def handle_event(
+        :info,
+        {:DOWN, monitor, :process, _, _},
+        _state,
+        %{owner_monitor: monitor} = data
+      ),
+      do: {:stop, :normal, data}
 
-  # A UART deliberately stopped during open/recovery may report its exit later.
-  def handle_info({:EXIT, _old_uart, _reason}, state), do: {:noreply, state}
+  def handle_event(
+        :info,
+        {:DOWN, monitor, :process, _, _},
+        state,
+        %{session: %{monitor: monitor}} = data
+      ),
+      do: release(state, data)
 
-  def handle_info({:session_expired, ref}, %{session: %{ref: ref}} = state),
-    do: {:noreply, release(state)}
+  # A named timeout survives leased <-> awaiting_response transitions.
+  def handle_event({:timeout, :session}, ref, state, %{session: %{ref: ref}} = data),
+    do: release(state, data)
 
-  def handle_info({:session_expired, _}, state), do: {:noreply, state}
+  def handle_event({:timeout, :session}, _, _state, _data), do: :keep_state_and_data
 
-  def handle_info({:DOWN, monitor, :process, _, _}, %{owner_monitor: monitor} = state),
-    do: {:stop, :normal, state}
+  def handle_event(
+        {:call, {owner, _} = from},
+        {:release, ref},
+        state,
+        %{session: %{ref: ref, owner: owner}} = data
+      ),
+      do: release(state, data, [{:reply, from, :ok}])
 
-  def handle_info({:DOWN, monitor, :process, _, _}, %{session: %{monitor: monitor}} = state),
-    do: {:noreply, release(state)}
+  def handle_event({:call, from}, {:release, _}, _state, _data),
+    do: reply(from, {:error, :invalid_session})
 
-  @impl true
-  def handle_call({:release, ref}, {owner, _}, %{session: %{ref: ref, owner: owner}} = state),
-    do: {:reply, :ok, release(state)}
-
-  def handle_call({:release, _}, _from, state),
-    do: {:reply, {:error, :invalid_session}, state}
-
-  def handle_call({:recover, deadline}, _from, state) do
+  def handle_event({:call, from}, {:recover, deadline}, _state, data) do
     cond do
-      AT.remaining(deadline) == 0 -> {:reply, {:error, :expired}, state}
-      state.session != nil -> {:reply, {:error, :busy}, state}
-      true -> reopen(state)
+      AT.remaining(deadline) == 0 -> reply(from, {:error, :expired})
+      data.session != nil -> reply(from, {:error, :busy})
+      true -> reopen(from, data)
     end
   end
 
-  def handle_call(_request, _from, %{blocked: true} = state),
-    do: {:reply, {:error, :desynchronized}, state}
+  def handle_event({:call, from}, _request, :recovery_required, _data),
+    do: reply(from, {:error, :desynchronized})
 
-  def handle_call(_request, _from, %{available: false} = state),
-    do: {:reply, {:error, :tty_not_open}, state}
+  def handle_event({:call, from}, _request, :unavailable, _data),
+    do: reply(from, {:error, :tty_not_open})
 
-  def handle_call(
+  def handle_event(
+        {:call, {owner, _} = from},
         {:exchange, ref, operation, deadline},
-        {owner, _},
-        %{session: %{ref: ref, owner: owner}} = state
+        state,
+        %{session: %{ref: ref, owner: owner}} = data
       ) do
-    deadline = min(deadline, state.session.deadline)
+    deadline = min(deadline, data.session.deadline)
 
     if AT.remaining(deadline) == 0 do
-      blocked = state.session.pending and AT.remaining(state.session.deadline) == 0
-      {:reply, {:error, :timeout}, %{state | blocked: blocked}}
+      next =
+        if state == :awaiting_response and AT.remaining(data.session.deadline) == 0,
+          do: :recovery_required,
+          else: state
+
+      transition(next, data, from, {:error, :timeout})
     else
-      perform(operation, deadline, state)
+      perform(operation, deadline, from, state, data)
     end
   end
 
-  def handle_call({:exchange, _, _, _}, _from, state),
-    do: {:reply, {:error, :invalid_session}, state}
+  def handle_event({:call, from}, {:exchange, _, _, _}, _state, _data),
+    do: reply(from, {:error, :invalid_session})
 
-  def handle_call(_request, _from, %{session: session} = state) when session != nil,
-    do: {:reply, {:error, :busy}, state}
-
-  def handle_call({:session, deadline}, {owner, _}, state) do
+  def handle_event({:call, {owner, _} = from}, {:session, deadline}, :idle, data) do
     if AT.remaining(deadline) == 0 or not Process.alive?(owner) do
-      {:reply, {:error, :expired}, state}
+      reply(from, {:error, :expired})
     else
       ref = make_ref()
 
@@ -181,73 +215,101 @@ defmodule VintageNetECM.AT.Channel do
         ref: ref,
         owner: owner,
         monitor: Process.monitor(owner),
-        timer: Process.send_after(self(), {:session_expired, ref}, AT.remaining(deadline)),
         deadline: deadline,
         buffer: "",
-        finals: nil,
-        pending: false
+        finals: nil
       }
 
       handle = %AT{channel: self(), ref: ref, deadline: deadline}
-      {:reply, {:ok, handle}, %{state | session: session}}
+
+      {:next_state, :leased, %{data | session: session},
+       [{:reply, from, {:ok, handle}}, {{:timeout, :session}, AT.remaining(deadline), ref}]}
     end
   end
 
-  defp reopen(state) do
-    close_uart(state.uart)
+  def handle_event({:call, from}, {:session, _}, _state, _data),
+    do: reply(from, {:error, :busy})
 
-    case open_uart(%{state | uart: nil, available: false}) do
-      {:ok, state} -> {:reply, :ok, %{state | blocked: false}}
-      {:error, reason, state} -> {:reply, {:error, reason}, %{state | blocked: true}}
-    end
-  end
-
-  defp perform({:send, bytes}, deadline, state) do
+  defp perform({:send, bytes}, deadline, from, _state, data) do
     case AT.validate_bytes(bytes) do
       :ok ->
-        result = write(state.uart, bytes, deadline)
-
-        state = put_in(state.session.pending, true)
-        {:reply, result, %{state | blocked: result != :ok}}
+        case write(data.uart, bytes, deadline) do
+          :ok -> transition(:awaiting_response, data, from, :ok)
+          error -> transition(:recovery_required, data, from, error)
+        end
 
       error ->
-        {:reply, error, state}
+        reply(from, error)
     end
   end
 
-  defp perform(:receive, deadline, state),
-    do: perform({:receive, state.session.finals}, deadline, state)
+  defp perform(:receive, deadline, from, state, data),
+    do: perform({:receive, data.session.finals}, deadline, from, state, data)
 
-  defp perform({:receive, finals}, deadline, state) do
-    case read_response(state.uart, state.session.buffer, state.markers, deadline, finals) do
+  defp perform({:receive, finals}, deadline, from, _state, data) do
+    case read_response(data.uart, data.session.buffer, data.markers, deadline, finals) do
       {:ok, event, rest} ->
+        next = if elem(event, 0) == :response, do: :leased, else: :awaiting_response
+
         session = %{
-          state.session
+          data.session
           | buffer: rest,
-            finals: if(elem(event, 0) != :response, do: finals),
-            pending: elem(event, 0) != :response
+            finals: if(next == :awaiting_response, do: finals)
         }
 
-        {:reply, {:ok, event}, %{state | session: session}}
+        transition(next, %{data | session: session}, from, {:ok, event})
 
       {:error, :timeout, buffer} ->
-        session = %{state.session | buffer: buffer, finals: finals, pending: true}
-        blocked = AT.remaining(session.deadline) == 0
-        {:reply, {:error, :timeout}, %{state | session: session, blocked: blocked}}
+        session = %{data.session | buffer: buffer, finals: finals}
 
-      {:error, reason, _buffer} ->
-        {:reply, {:error, reason}, %{state | blocked: true}}
+        next =
+          if AT.remaining(session.deadline) == 0, do: :recovery_required, else: :awaiting_response
+
+        transition(next, %{data | session: session}, from, {:error, :timeout})
+
+      {:error, reason, _} ->
+        transition(:recovery_required, data, from, {:error, reason})
     end
   end
 
-  defp perform(:drain, _deadline, %{session: %{pending: true}} = state),
-    do: {:reply, {:error, :exchange_pending}, state}
+  defp perform(:drain, _deadline, from, :awaiting_response, _data),
+    do: reply(from, {:error, :exchange_pending})
 
-  defp perform(:drain, _deadline, state) do
-    case io(fn -> Circuits.UART.read(state.uart, 0) end) do
-      {:ok, _} -> {:reply, :ok, put_in(state.session.buffer, "")}
-      {:error, _} = error -> {:reply, error, %{state | blocked: true}}
+  defp perform(:drain, _deadline, from, :leased, data) do
+    case io(fn -> Circuits.UART.read(data.uart, 0) end) do
+      {:ok, _} -> transition(:leased, put_in(data.session.buffer, ""), from, :ok)
+      error -> transition(:recovery_required, data, from, error)
     end
+  end
+
+  defp reply(from, result), do: {:keep_state_and_data, [{:reply, from, result}]}
+
+  defp transition(state, data, from, result),
+    do: {:next_state, state, data, [{:reply, from, result}]}
+
+  defp release(state, data, actions \\ []) do
+    Process.demonitor(data.session.monitor, [:flush])
+    next = if state == :leased, do: :idle, else: :recovery_required
+    {:next_state, next, %{data | session: nil}, [{{:timeout, :session}, :cancel} | actions]}
+  end
+
+  defp reopen(from, data) do
+    close_uart(data.uart)
+
+    case open_uart(%{data | uart: nil}) do
+      {:ok, data} -> transition(:idle, data, from, :ok)
+      {:error, reason, data} -> transition(:recovery_required, data, from, {:error, reason})
+    end
+  end
+
+  defp publish_recovery(%{ifname: nil}, _required), do: :ok
+
+  defp publish_recovery(data, required) do
+    PropertyTable.put(
+      VintageNet,
+      ["interface", data.ifname, "mobile", "recovery_required"],
+      required
+    )
   end
 
   defp read_response(uart, buffer, markers, deadline, finals) do
@@ -269,28 +331,21 @@ defmodule VintageNetECM.AT.Channel do
     end
   end
 
-  defp release(state) do
-    _ = Process.cancel_timer(state.session.timer)
-    Process.demonitor(state.session.monitor, [:flush])
-    %{state | session: nil, blocked: state.blocked or state.session.pending}
-  end
-
-  defp open_uart(state) do
+  defp open_uart(data) do
     case Circuits.UART.start_link() do
-      {:ok, uart} -> configure_uart(uart, state)
-      {:error, reason} -> {:error, reason, state}
+      {:ok, uart} -> configure_uart(uart, data)
+      {:error, reason} -> {:error, reason, data}
     end
   end
 
-  defp configure_uart(uart, state) do
-    with :ok <-
-           io(fn -> Circuits.UART.open(uart, state.tty, speed: state.speed, active: false) end),
+  defp configure_uart(uart, data) do
+    with :ok <- io(fn -> Circuits.UART.open(uart, data.tty, speed: data.speed, active: false) end),
          :ok <- io(fn -> Circuits.UART.flush(uart, :receive) end) do
-      {:ok, %{state | uart: uart, available: true}}
+      {:ok, %{data | uart: uart}}
     else
       {:error, reason} ->
         close_uart(uart)
-        {:error, reason, state}
+        {:error, reason, data}
     end
   end
 
@@ -316,14 +371,19 @@ defmodule VintageNetECM.AT.Channel do
   end
 
   @impl true
-  def terminate(_reason, state), do: close_uart(state.uart)
+  def terminate(_reason, _state, data), do: close_uart(data.uart)
 
   @impl true
   def format_status(status) do
     Map.new(status, fn
-      {:log, _} -> {:log, []}
-      {key, _} when key in [:state, :message, :reason] -> {key, :redacted}
-      entry -> entry
+      {:log, _} ->
+        {:log, []}
+
+      {key, _} when key in [:state, :data, :message, :reason, :queue, :postponed, :timeouts] ->
+        {key, :redacted}
+
+      entry ->
+        entry
     end)
   end
 end

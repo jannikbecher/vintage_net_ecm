@@ -103,6 +103,9 @@ defmodule VintageNetECM.TestPTY do
     {:noreply, %{state | buffer: buffer}}
   end
 
+  def handle_info({:circuits_uart, _, {:error, _}}, %{os_pid: nil} = state),
+    do: {:noreply, state}
+
   def handle_info({:EXIT, _port, :normal}, state), do: {:noreply, state}
   def handle_info({_port, {:data, _}}, state), do: {:noreply, state}
   def handle_info({_port, {:exit_status, _}}, state), do: {:noreply, %{state | os_pid: nil}}

@@ -237,9 +237,45 @@ input. Reopening or restarting a supervisor is not itself modem recovery, does
 not cancel pending modem operations, and must not be used as an automatic retry.
 Initial tty-open failures retry without sending commands; failures after an
 exchange has begun require completion/cancellation within the session or explicit
-recovery afterwards. The managed controller does not choose an abort sequence;
-its unfinished exchanges also require explicit recovery. See `VintageNetECM.AT` for the
-full session contract.
+recovery afterwards. See `VintageNetECM.AT` for the full session contract.
+
+### Application-owned recovery
+
+For a managed interface, the channel publishes a boolean property:
+
+```elixir
+property = ["interface", "usb1", "mobile", "recovery_required"]
+VintageNet.subscribe(property)
+VintageNet.get(property)
+# Notifications: {VintageNet, property, old_value, new_value, metadata}
+```
+
+Subscribe first, then read the current value so you also notice an existing
+failure. `true` means AT work is blocked and the application needs to recover
+its modem. This includes failures during radio initialization, background polls,
+and application sessions. The controller pauses AT work instead of repeatedly
+trying the blocked channel. It does not deliberately tear down IP connectivity.
+
+Restore the modem's protocol state using a procedure appropriate for your modem
+and application, then call:
+
+```elixir
+VintageNetECM.recover("usb1")
+```
+
+This reopens the UART, clears the flag on success, and lets the controller rerun
+radio initialization and resume polling. It is usable even if initialization
+never completed. `:ok` means the UART reopened, not that network registration has
+completed. Failed recovery leaves the flag set; an active session returns
+`{:error, :busy}`. No automatic abort, modem reset, or replay of an uncertain
+application command is performed. Your application decides whether and when to
+attempt recovery. A `false` flag only means recovery is not currently required;
+it does not indicate network readiness.
+
+Internally, the channel is an OTP `:gen_statem` with five states: unavailable,
+idle, leased, awaiting response, and recovery required. The public session API
+is unchanged. Standalone applications continue to use `AT.Channel.recover/1`
+after restoring the modem; they do not need VintageNet property subscriptions.
 
 Tests require `socat` to exercise real pseudo-terminals (`mix test`).
 

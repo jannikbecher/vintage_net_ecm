@@ -15,8 +15,9 @@ defmodule VintageNetECM.ATController do
 
   Every operation leases the same channel as application sessions. Busy or
   unavailable channels defer polling without discarding controller state.
-  Unfinished sessions and I/O failures require explicit modem recovery followed
-  by `AT.Channel.recover/1`; the controller does not guess an abort sequence.
+  Unfinished sessions and I/O failures publish `mobile.recovery_required` and
+  pause AT work. The application must restore the modem's protocol state and
+  call `VintageNetECM.recover/1`; the controller then reruns initialization.
   External managed sessions are admitted only after radio initialization.
 
   Vendor-specific commands belong to `VintageNetECM.Modem`. Teardown runs after
@@ -72,12 +73,12 @@ defmodule VintageNetECM.ATController do
   def deactivate_data_call(modem, tty, context_id) do
     # An unlinked, short-lived channel keeps an init failure from killing the
     # teardown caller (for example, if the tty is still owned).
-    case GenServer.start(AT.Channel, tty: tty, owner: self()) do
+    case AT.Channel.start(tty: tty, owner: self()) do
       {:ok, channel} ->
         try do
           AT.session(channel, &modem.deactivate_data_call(&1, context_id), timeout: 6_000)
         after
-          if Process.alive?(channel), do: GenServer.stop(channel)
+          if Process.alive?(channel), do: :gen_statem.stop(channel)
         end
 
       {:error, reason} ->
@@ -89,12 +90,17 @@ defmodule VintageNetECM.ATController do
 
   @impl true
   def init(opts) do
+    ifname = Keyword.fetch!(opts, :ifname)
+    property = ["interface", ifname, "mobile", "recovery_required"]
+    :ok = VintageNet.subscribe(property)
+
     state = %{
       ifname: Keyword.fetch!(opts, :ifname),
       channel: Keyword.fetch!(opts, :channel),
       channel_pid: nil,
       channel_monitor: nil,
       ready: false,
+      recovery_required: VintageNet.get(property, false),
       generation: make_ref(),
       at: nil,
       context_id: Keyword.get(opts, :context_id, 1),
@@ -107,6 +113,9 @@ defmodule VintageNetECM.ATController do
   end
 
   @impl true
+  def handle_continue(:initialize, %{recovery_required: true} = state),
+    do: {:noreply, state}
+
   def handle_continue(:initialize, state) do
     state = watch_channel(%{state | generation: make_ref()})
 
@@ -135,6 +144,19 @@ defmodule VintageNetECM.ATController do
   end
 
   @impl true
+  def handle_info(
+        {VintageNet, ["interface", ifname, "mobile", "recovery_required"], _, required, _},
+        %{ifname: ifname} = state
+      )
+      when is_boolean(required) do
+    state = %{state | recovery_required: required, ready: false, generation: make_ref()}
+
+    if required,
+      do: {:noreply, state},
+      else: {:noreply, state, {:continue, :initialize}}
+  end
+
+  def handle_info(:initialize, %{recovery_required: true} = state), do: {:noreply, state}
   def handle_info(:initialize, %{ready: true} = state), do: {:noreply, state}
   def handle_info(:initialize, state), do: {:noreply, state, {:continue, :initialize}}
 
@@ -204,6 +226,10 @@ defmodule VintageNetECM.ATController do
   end
 
   @impl true
+  def handle_call(request, _from, %{recovery_required: true} = state)
+      when request in [:channel, :network_time],
+      do: {:reply, {:error, :desynchronized}, state}
+
   def handle_call(:channel, _from, state) do
     result =
       if state.ready and state.channel_pid == GenServer.whereis(state.channel),

@@ -87,6 +87,7 @@ defmodule VintageNetECM do
       {AT.Channel,
        [
          tty: at_tty,
+         ifname: ifname,
          name: channel_name(ifname),
          intermediate_responses: Map.fetch!(ecm, :intermediate_responses)
        ]}
@@ -119,6 +120,24 @@ defmodule VintageNetECM do
   @doc false
   def channel_name(ifname),
     do: {:via, Registry, {VintageNet.Interface.Registry, {AT.Channel, ifname}}}
+
+  @doc """
+  Resume a configured interface after the application has recovered the modem.
+
+  A fenced channel publishes `true` at
+  `["interface", ifname, "mobile", "recovery_required"]`. Subscribe with
+  `VintageNet.subscribe/1` to be notified, and read with `VintageNet.get/1`.
+  Background AT work pauses until recovery; existing IP connectivity is not
+  deliberately torn down.
+
+  This call only reopens the UART and discards stale input. It does not abort a
+  command, reset the modem, or establish that an uncertain SMS was not sent.
+  Restore the modem's protocol state first, then call this function. On success
+  the flag becomes `false` and radio initialization resumes asynchronously.
+  `:ok` means the UART reopened, not that the modem has registered on the network.
+  """
+  @spec recover(VintageNet.ifname()) :: :ok | {:error, term()}
+  def recover(ifname), do: AT.Channel.recover(channel_name(ifname))
 
   @doc "Ask the modem for the current network time in UTC."
   @spec utc_now(VintageNet.ifname()) :: {:ok, DateTime.t()} | {:error, term()}
