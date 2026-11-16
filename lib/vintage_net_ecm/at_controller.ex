@@ -15,11 +15,13 @@ defmodule VintageNetECM.ATController do
 
   Every operation leases the same channel as application sessions. Busy or
   unavailable channels defer polling without discarding controller state.
+  Unfinished sessions and I/O failures require explicit modem recovery followed
+  by `AT.Channel.recover/1`; the controller does not guess an abort sequence.
   External managed sessions are admitted only after radio initialization.
 
   Vendor-specific commands belong to `VintageNetECM.Modem`. Teardown runs after
   VintageNet stops its children, so `deactivate_data_call/3` uses a temporary
-  supervisor and channel rather than accessing a UART directly.
+  channel rather than accessing a UART directly.
   """
   use GenServer
   require Logger
@@ -68,18 +70,18 @@ defmodule VintageNetECM.ATController do
 
   @doc false
   def deactivate_data_call(modem, tty, context_id) do
-    {:ok, supervisor} = Supervisor.start_link([], strategy: :one_for_one)
-
-    try do
-      case Supervisor.start_child(supervisor, {AT.Channel, tty: tty}) do
-        {:ok, channel} ->
+    # An unlinked, short-lived channel keeps an init failure from killing the
+    # teardown caller (for example, if the tty is still owned).
+    case GenServer.start(AT.Channel, tty: tty, owner: self()) do
+      {:ok, channel} ->
+        try do
           AT.session(channel, &modem.deactivate_data_call(&1, context_id), timeout: 6_000)
+        after
+          if Process.alive?(channel), do: GenServer.stop(channel)
+        end
 
-        {:error, reason} ->
-          Logger.warning("[VintageNetECM] deactivate: channel unavailable: #{inspect(reason)}")
-      end
-    after
-      Supervisor.stop(supervisor)
+      {:error, reason} ->
+        Logger.warning("[VintageNetECM] deactivate: channel unavailable: #{inspect(reason)}")
     end
 
     :ok
@@ -93,6 +95,7 @@ defmodule VintageNetECM.ATController do
       channel_pid: nil,
       channel_monitor: nil,
       ready: false,
+      generation: make_ref(),
       at: nil,
       context_id: Keyword.get(opts, :context_id, 1),
       apn: Keyword.fetch!(opts, :apn),
@@ -105,7 +108,7 @@ defmodule VintageNetECM.ATController do
 
   @impl true
   def handle_continue(:initialize, state) do
-    state = watch_channel(state)
+    state = watch_channel(%{state | generation: make_ref()})
 
     result =
       AT.session(
@@ -122,7 +125,7 @@ defmodule VintageNetECM.ATController do
 
     with {:initialized, initialized} <- result,
          :ok <- AT.session(state.channel_pid, fn _ -> :ok end) do
-      send(self(), :check_registration)
+      send(self(), {:poll, initialized.generation, :check_registration})
       {:noreply, %{initialized | at: nil, ready: true}}
     else
       _ ->
@@ -137,8 +140,15 @@ defmodule VintageNetECM.ATController do
 
   def handle_info({:DOWN, monitor, :process, _, _}, %{channel_monitor: monitor} = state) do
     send(self(), :initialize)
-    {:noreply, %{state | ready: false, channel_pid: nil, channel_monitor: nil}}
+
+    {:noreply,
+     %{state | ready: false, channel_pid: nil, channel_monitor: nil, generation: make_ref()}}
   end
+
+  def handle_info({:poll, generation, event}, %{generation: generation} = state),
+    do: handle_info(event, state)
+
+  def handle_info({:poll, _, _}, state), do: {:noreply, state}
 
   def handle_info(event, %{ready: false} = state) when event in [:monitor, :check_registration],
     do: {:noreply, state}
@@ -163,7 +173,7 @@ defmodule VintageNetECM.ATController do
 
     event = if result == :registered, do: :monitor, else: :check_registration
     delay = if event == :monitor, do: @monitor_interval, else: @register_poll
-    Process.send_after(self(), event, delay)
+    schedule(state, event, delay)
     {:noreply, state}
   end
 
@@ -184,8 +194,8 @@ defmodule VintageNetECM.ATController do
         timeout: 60_000
       )
 
-    Process.send_after(
-      self(),
+    schedule(
+      state,
       :monitor,
       if(is_map(result), do: @monitor_interval, else: @register_poll)
     )
@@ -219,6 +229,9 @@ defmodule VintageNetECM.ATController do
       entry -> entry
     end)
   end
+
+  defp schedule(state, event, delay),
+    do: Process.send_after(self(), {:poll, state.generation, event}, delay)
 
   defp watch_channel(state) do
     pid = GenServer.whereis(state.channel)

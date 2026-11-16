@@ -76,6 +76,17 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
     assert state.static == old_state.static
     assert VintageNetECM.command(context.ifname, "AT") == {:ok, []}
     assert_receive {:at_command, "ATQ0V1"}
+    :sys.get_state(context.controller)
+    flush_commands()
+
+    send(context.controller, {:poll, old_state.generation, :monitor})
+    send(context.controller, {:poll, old_state.generation, :check_registration})
+    :sys.get_state(context.controller)
+    refute_received {:at_command, _}
+
+    send(context.controller, {:poll, state.generation, :monitor})
+    :sys.get_state(context.controller)
+    assert_receive {:at_command, "AT+CEREG?"}
   end
 
   test "teardown cannot steal a live tty and uses a supervised channel after shutdown", context do
@@ -99,6 +110,19 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
     assert_receive {:at_command, "AT+QNETDEVCTL=0,1,1"}
   end
 
+  test "controller does not automatically recover an unfinished session", context do
+    assert VintageNetECM.command(context.ifname, "AT+SLOW", timeout: 30) == {:error, :timeout}
+    assert_receive {:at_command, "AT+SLOW"}
+    assert :sys.get_state(context.channel).blocked
+    :ok = PTY.write(context.pty, "OK\r\n")
+
+    send(context.controller, :monitor)
+    :sys.get_state(context.controller)
+    assert :sys.get_state(context.channel).blocked
+    refute_received {:at_command, _}
+    assert VintageNetECM.command(context.ifname, "AT") == {:error, :desynchronized}
+  end
+
   test "initial unavailability refuses admission and supervises UART retries" do
     ifname = "missing#{System.unique_integer([:positive])}"
     name = VintageNetECM.channel_name(ifname)
@@ -115,6 +139,8 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
     assert AT.session(channel, fn _ -> flunk("unavailable") end) == {:error, :tty_not_open}
     refute :sys.get_state(channel).blocked
   end
+
+  defp response("AT+SLOW"), do: ""
 
   defp response(command) do
     lines =

@@ -9,9 +9,12 @@ defmodule VintageNetECM.AT.Channel do
   Add `{VintageNetECM.AT.Channel, tty: "/dev/ttyUSB2", name: MyApp.Modem}` to your
   supervision tree, then use `VintageNetECM.AT.session/3` with its name or PID.
   Options are `:tty`, `:name`, `:speed` (115,200), and `:intermediate_responses` (`[]`).
+  An optional `:owner` PID bounds the lifetime of a temporary, unlinked channel.
   Tty paths are claimed once per node. Do not use aliases for an already-owned tty.
 
-  A failed or unfinished exchange fences the channel. After explicitly recovering
+  Receive timeouts leave the exchange pending for the owner to finish or abort
+  within the session deadline. I/O failures and sessions ending with an
+  unfinished exchange fence the channel. After explicitly recovering
   the modem, call `recover/1` to reopen the UART and discard stale input. Reopening
   alone does not cancel a modem operation. Nothing retries uncertain writes.
   Supervision restarts are not a modem recovery procedure.
@@ -24,7 +27,10 @@ defmodule VintageNetECM.AT.Channel do
   end
 
   @doc "Reopen a fenced channel only after the modem has been explicitly recovered."
-  def recover(channel), do: call(channel, :recover, System.monotonic_time(:millisecond) + 5_000)
+  def recover(channel) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    call(channel, {:recover, deadline}, deadline)
+  end
 
   @doc false
   def session(channel, callback, opts) when is_function(callback, 1) do
@@ -69,6 +75,7 @@ defmodule VintageNetECM.AT.Channel do
         uart: nil,
         available: false,
         blocked: false,
+        owner_monitor: if(opts[:owner], do: Process.monitor(opts[:owner])),
         session: nil
       }
 
@@ -116,6 +123,9 @@ defmodule VintageNetECM.AT.Channel do
 
   def handle_info({:session_expired, _}, state), do: {:noreply, state}
 
+  def handle_info({:DOWN, monitor, :process, _, _}, %{owner_monitor: monitor} = state),
+    do: {:stop, :normal, state}
+
   def handle_info({:DOWN, monitor, :process, _, _}, %{session: %{monitor: monitor}} = state),
     do: {:noreply, release(state)}
 
@@ -126,15 +136,11 @@ defmodule VintageNetECM.AT.Channel do
   def handle_call({:release, _}, _from, state),
     do: {:reply, {:error, :invalid_session}, state}
 
-  def handle_call(:recover, _from, %{session: session} = state) when session != nil,
-    do: {:reply, {:error, :busy}, state}
-
-  def handle_call(:recover, _from, state) do
-    close_uart(state.uart)
-
-    case open_uart(%{state | uart: nil, available: false}) do
-      {:ok, state} -> {:reply, :ok, %{state | blocked: false}}
-      {:error, reason, state} -> {:reply, {:error, reason}, %{state | blocked: true}}
+  def handle_call({:recover, deadline}, _from, state) do
+    cond do
+      AT.remaining(deadline) == 0 -> {:reply, {:error, :expired}, state}
+      state.session != nil -> {:reply, {:error, :busy}, state}
+      true -> reopen(state)
     end
   end
 
@@ -152,7 +158,8 @@ defmodule VintageNetECM.AT.Channel do
     deadline = min(deadline, state.session.deadline)
 
     if AT.remaining(deadline) == 0 do
-      {:reply, {:error, :timeout}, %{state | blocked: state.session.pending}}
+      blocked = state.session.pending and AT.remaining(state.session.deadline) == 0
+      {:reply, {:error, :timeout}, %{state | blocked: blocked}}
     else
       perform(operation, deadline, state)
     end
@@ -177,11 +184,21 @@ defmodule VintageNetECM.AT.Channel do
         timer: Process.send_after(self(), {:session_expired, ref}, AT.remaining(deadline)),
         deadline: deadline,
         buffer: "",
+        finals: nil,
         pending: false
       }
 
       handle = %AT{channel: self(), ref: ref, deadline: deadline}
       {:reply, {:ok, handle}, %{state | session: session}}
+    end
+  end
+
+  defp reopen(state) do
+    close_uart(state.uart)
+
+    case open_uart(%{state | uart: nil, available: false}) do
+      {:ok, state} -> {:reply, :ok, %{state | blocked: false}}
+      {:error, reason, state} -> {:reply, {:error, reason}, %{state | blocked: true}}
     end
   end
 
@@ -198,19 +215,28 @@ defmodule VintageNetECM.AT.Channel do
     end
   end
 
-  defp perform(:receive, deadline, state) do
-    case read_response(state.uart, state.session.buffer, state.markers, deadline) do
+  defp perform(:receive, deadline, state),
+    do: perform({:receive, state.session.finals}, deadline, state)
+
+  defp perform({:receive, finals}, deadline, state) do
+    case read_response(state.uart, state.session.buffer, state.markers, deadline, finals) do
       {:ok, event, rest} ->
         session = %{
           state.session
           | buffer: rest,
+            finals: if(elem(event, 0) != :response, do: finals),
             pending: elem(event, 0) != :response
         }
 
         {:reply, {:ok, event}, %{state | session: session}}
 
-      {:error, _} = error ->
-        {:reply, error, %{state | blocked: true}}
+      {:error, :timeout, buffer} ->
+        session = %{state.session | buffer: buffer, finals: finals, pending: true}
+        blocked = AT.remaining(session.deadline) == 0
+        {:reply, {:error, :timeout}, %{state | session: session, blocked: blocked}}
+
+      {:error, reason, _buffer} ->
+        {:reply, {:error, reason}, %{state | blocked: true}}
     end
   end
 
@@ -224,15 +250,21 @@ defmodule VintageNetECM.AT.Channel do
     end
   end
 
-  defp read_response(uart, buffer, markers, deadline) do
+  defp read_response(uart, buffer, markers, deadline, finals) do
+    parsed =
+      if finals,
+        do: AT.parse_response(buffer, markers, finals),
+        else: AT.parse_response(buffer, markers)
+
     with true <- AT.remaining(deadline) > 0,
-         :more <- AT.parse_response(buffer, markers),
+         :more <- parsed,
          {:ok, bytes} when bytes != "" <-
            io(fn -> Circuits.UART.read(uart, AT.remaining(deadline)) end) do
-      read_response(uart, buffer <> bytes, markers, deadline)
+      read_response(uart, buffer <> bytes, markers, deadline, finals)
     else
-      false -> {:error, :timeout}
-      {:ok, ""} -> {:error, :timeout}
+      false -> {:error, :timeout, buffer}
+      {:ok, ""} -> {:error, :timeout, buffer}
+      {:error, reason} -> {:error, reason, buffer}
       result -> result
     end
   end

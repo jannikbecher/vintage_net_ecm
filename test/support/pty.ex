@@ -115,7 +115,7 @@ defmodule VintageNetECM.TestPTY do
   end
 
   defp stop_socat(port, os_pid) do
-    System.cmd("kill", ["-TERM", to_string(os_pid)], stderr_to_stdout: true)
+    _ = System.cmd("kill", ["-TERM", to_string(os_pid)], stderr_to_stdout: true)
 
     receive do
       {^port, {:exit_status, _}} -> :ok

@@ -16,7 +16,7 @@ defmodule VintageNetECM.AT do
   @enforce_keys [:channel, :ref, :deadline]
   defstruct [:channel, :ref, :deadline]
 
-  @opaque session :: %__MODULE__{channel: pid(), ref: reference(), deadline: integer()}
+  @type session :: %__MODULE__{channel: pid(), ref: reference(), deadline: integer()}
   @type event :: {:intermediate, binary()} | {:response, [String.t()]}
   @max_response 16_384
   @final_results ["OK", "ERROR", "NO CARRIER", "NO DIALTONE", "NO DIAL TONE", "BUSY", "NO ANSWER"]
@@ -31,9 +31,13 @@ defmodule VintageNetECM.AT do
   `:timeout` (default 5,000 ms) bounds acquisition and every UART operation, not
   arbitrary callback code. Per-operation timeouts may shorten, never extend it.
 
-  Incomplete exchanges, I/O failures and response timeouts fence further traffic
-  with `{:error, :desynchronized}`. A lost call returns `:outcome_unknown`; never
-  automatically retry a write. See `VintageNetECM.AT.Channel.recover/1`.
+  A receive timeout leaves the exchange pending. Within the remaining session
+  deadline, the owner may receive again or send a modem-specific abort sequence
+  and consume its final response. No abort bytes are sent automatically.
+  Leaving an exchange unfinished (including session expiry) or an I/O failure
+  fences further traffic with `{:error, :desynchronized}`. A lost call returns
+  `:outcome_unknown`; never automatically retry a write.
+  See `VintageNetECM.AT.Channel.recover/1`.
   """
   @spec session(GenServer.server(), (session() -> term()), keyword()) :: term()
   defdelegate session(channel, callback, opts \\ []), to: Channel
@@ -57,15 +61,22 @@ defmodule VintageNetECM.AT do
   intermediate marker are consumed. Notifications are not independently routed.
 
   A final response completes the exchange, even when its result is an error.
-  Intermediate events do not. Unsupported CONNECT/data mode, failed I/O and
-  timeouts fence further traffic. Responses are bounded to 16,384 bytes.
+  Intermediate events do not. A receive timeout preserves buffered fragments
+  and leaves the exchange pending so the owner can explicitly finish or cancel
+  it within the session deadline. `command/3` cannot start another command while
+  an exchange is pending. Unsupported CONNECT/data mode and failed I/O fence
+  further traffic immediately. Responses are bounded to 16,384 bytes.
   `:timeout` defaults to 5,000 ms and cannot extend the session deadline.
   """
   @spec receive(session(), keyword()) :: {:ok, event()} | {:error, term()}
   def receive(%__MODULE__{} = session, opts \\ []),
     do: Channel.exchange(session, :receive, opts)
 
-  @doc "Send a standard AT command. Echo and OK are omitted; modem errors retain their existing tuples."
+  @doc """
+  Send a standard AT command. Echo and OK are omitted; modem errors retain their
+  existing tuples. Call-progress notifications (such as NO CARRIER) are ignored
+  except for dial, answer and hang-up commands, where they are terminal results.
+  """
   @spec command(session(), String.t(), keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def command(%__MODULE__{} = session, cmd, opts \\ []) do
     with {:ok, deadline} <- deadline(opts, session.deadline) do
@@ -73,10 +84,17 @@ defmodule VintageNetECM.AT do
 
       with :ok <- Channel.exchange(session, :drain, opts),
            :ok <- send(session, cmd <> "\r", opts),
-           {:ok, event} <- __MODULE__.receive(session, opts) do
+           {:ok, event} <- Channel.exchange(session, {:receive, command_finals(cmd)}, opts) do
         command_result(event)
       end
     end
+  end
+
+  # Call-progress results are terminal only for dial/answer/hang-up commands.
+  defp command_finals(cmd) do
+    if String.match?(String.upcase(cmd), ~r/^AT(?:D|A(?:;|$)|H(?:\d|;|$))/),
+      do: @final_results,
+      else: ["OK", "ERROR"]
   end
 
   defp command_result({:intermediate, _}), do: {:error, :unexpected_intermediate}
@@ -110,12 +128,14 @@ defmodule VintageNetECM.AT do
   defp valid_marker?(_, _), do: false
 
   @doc false
-  def parse_response(buffer, markers) when byte_size(buffer) <= @max_response,
-    do: parse_response(buffer, markers, [])
+  def parse_response(buffer, markers, finals \\ @final_results)
 
-  def parse_response(_buffer, _markers), do: {:error, :response_too_large}
+  def parse_response(buffer, markers, finals) when byte_size(buffer) <= @max_response,
+    do: parse_response(buffer, markers, finals, [])
 
-  defp parse_response(buffer, markers, lines) do
+  def parse_response(_buffer, _markers, _finals), do: {:error, :response_too_large}
+
+  defp parse_response(buffer, markers, finals, lines) do
     case frame(buffer, markers) do
       {:intermediate, marker, rest} ->
         {:ok, {:intermediate, marker}, rest}
@@ -125,11 +145,11 @@ defmodule VintageNetECM.AT do
           line == @data_mode or String.starts_with?(line, @data_mode <> " ") ->
             {:error, :unsupported_data_mode}
 
-          line in @final_results or String.starts_with?(line, @error_prefixes) ->
+          line in finals or String.starts_with?(line, @error_prefixes) ->
             {:ok, {:response, Enum.reverse([line | lines])}, rest}
 
           true ->
-            parse_response(rest, markers, [line | lines])
+            parse_response(rest, markers, finals, [line | lines])
         end
 
       {:more, _partial} ->
@@ -188,7 +208,7 @@ defmodule VintageNetECM.AT do
   def parse(raw) do
     raw
     |> String.split(~r/\r\n|\r|\n/, trim: true)
-    |> Enum.reject(&(&1 == "OK" or String.starts_with?(&1, "AT")))
+    |> Enum.reject(&(&1 in @final_results or String.starts_with?(&1, "AT")))
   end
 
   @doc false

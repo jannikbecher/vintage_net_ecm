@@ -29,7 +29,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmnl-dev
+          sudo apt-get install -y libmnl-dev socat
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1

@@ -201,16 +201,44 @@ data mode is unsupported. Response buffering is bounded to 16,384 bytes.
 
 The session timeout (default 5,000 ms) bounds UART access, not callback execution;
 per-operation timeouts cannot extend it. Handles belong to the callback's PID.
-Unfinished exchanges, response timeouts and I/O failures fence further traffic
-with `{:error, :desynchronized}`. Lost calls return `{:error, :outcome_unknown}`.
-Never automatically retry uncertain writes.
+A receive timeout leaves the exchange pending and preserves buffered fragments.
+The owner can receive again, or send a modem-specific abort sequence and consume
+its final response, within the remaining session deadline. No automatic abort,
+resynchronization or retry is performed. `AT.command/3` returns
+`{:error, :exchange_pending}` until the current exchange finishes.
+
+For example, **only when the modem documents ESC as cancellation in the current
+protocol state**, handle a receive timeout inside the same session:
+
+```elixir
+case AT.receive(at, timeout: 5_000) do
+  {:error, :timeout} ->
+    with :ok <- AT.send(at, <<27>>),
+         {:ok, {:response, lines}} <- AT.receive(at, timeout: 2_000) do
+      {:cancelled, lines}
+    end
+
+  result ->
+    result
+end
+```
+
+Set a longer session timeout to leave time for cancellation. Sending ESC alone
+is not confirmation: interpret the modem's response before assuming cancellation
+succeeded, and never automatically resend an SMS whose outcome is uncertain.
+
+Leaving the session unfinished, session expiry with a pending exchange, and I/O
+failures fence further traffic with `{:error, :desynchronized}`. Lost calls return
+`{:error, :outcome_unknown}`. Never automatically retry uncertain writes.
 
 After explicitly recovering the modem's protocol state, call
 `VintageNetECM.AT.Channel.recover(channel)` to reopen the UART and discard stale
 input. Reopening or restarting a supervisor is not itself modem recovery, does
 not cancel pending modem operations, and must not be used as an automatic retry.
 Initial tty-open failures retry without sending commands; failures after an
-exchange has begun require explicit recovery. See `VintageNetECM.AT` for the
+exchange has begun require completion/cancellation within the session or explicit
+recovery afterwards. The managed controller does not choose an abort sequence;
+its unfinished exchanges also require explicit recovery. See `VintageNetECM.AT` for the
 full session contract.
 
 Tests require `socat` to exercise real pseudo-terminals (`mix test`).

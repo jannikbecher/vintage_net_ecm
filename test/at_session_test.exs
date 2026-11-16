@@ -82,7 +82,7 @@ defmodule VintageNetECM.ATSessionTest do
     end
   end
 
-  test "a shortened operation deadline fences a pending exchange immediately", %{
+  test "an expired operation deadline does not fence a still-live session", %{
     channel: channel,
     pty: pty
   } do
@@ -91,10 +91,13 @@ defmodule VintageNetECM.ATSessionTest do
       assert PTY.read(pty, 3) == "AT\r"
       expired = %{at | deadline: System.monotonic_time(:millisecond) - 1}
       assert AT.receive(expired) == {:error, :timeout}
-      assert AT.receive(at) == {:error, :desynchronized}
+      refute :sys.get_state(channel).blocked
+      assert AT.command(at, "AT") == {:error, :exchange_pending}
+      assert PTY.write(pty, "OK\r\n") == :ok
+      assert AT.receive(at) == {:ok, {:response, ["OK"]}}
     end)
 
-    assert AT.session(channel, fn _ -> flunk("fenced") end) == {:error, :desynchronized}
+    assert AT.session(channel, fn _ -> :clean end) == :clean
   end
 
   test "response timeout obeys the session deadline and recovery never replays writes", %{
@@ -266,6 +269,138 @@ defmodule VintageNetECM.ATSessionTest do
     os_pid = :sys.get_state(pty).os_pid
     :ok = stop_supervised(PTY)
     assert {_, 1} = System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true)
+  end
+
+  test "ordinary commands ignore call-progress URCs without finishing early", %{
+    channel: channel,
+    pty: pty
+  } do
+    task = Task.async(fn -> AT.session(channel, &AT.command(&1, "AT+CGMI")) end)
+    assert PTY.read(pty, 8) == "AT+CGMI\r"
+    :ok = PTY.write(pty, "NO CARRIER\r\nBUSY\r\nNO ANSWER\r\n")
+    assert Task.yield(task, 20) == nil
+    :ok = PTY.write(pty, "Quectel\r\nOK\r\n")
+    assert Task.await(task) == {:ok, ["Quectel"]}
+
+    task = Task.async(fn -> AT.session(channel, &AT.command(&1, "ATD123")) end)
+    assert PTY.read(pty, 7) == "ATD123\r"
+    :ok = PTY.write(pty, "NO CARRIER\r\n")
+    assert Task.await(task) == {:error, :error}
+    assert AT.session(channel, fn _ -> :clean end) == :clean
+  end
+
+  test "the owner can finish a fragmented reply after a command timeout", %{
+    channel: channel,
+    pty: pty
+  } do
+    AT.session(channel, fn at ->
+      task =
+        Task.async(fn ->
+          assert PTY.read(pty, 3) == "AT\r"
+          :ok = PTY.write(pty, "NO CARRIER\r\nO")
+        end)
+
+      assert AT.command(at, "AT", timeout: 100) == {:error, :timeout}
+      Task.await(task)
+      refute :sys.get_state(channel).blocked
+      assert AT.command(at, "AT") == {:error, :exchange_pending}
+      :ok = PTY.write(pty, "K\r\n")
+      assert AT.receive(at) == {:ok, {:response, ["NO CARRIER", "OK"]}}
+    end)
+
+    assert AT.session(channel, fn _ -> :clean end) == :clean
+    assert {:ok, ""} = Circuits.UART.read(:sys.get_state(pty).peer, 0)
+  end
+
+  test "the owner can cancel a prompt with ESC after a receive timeout", %{
+    channel: channel,
+    pty: pty
+  } do
+    AT.session(
+      channel,
+      fn at ->
+        assert AT.send(at, "AT+CMGS=1\r") == :ok
+        assert PTY.read(pty, 10) == "AT+CMGS=1\r"
+        :ok = PTY.write(pty, "> ")
+        assert AT.receive(at) == {:ok, {:intermediate, "> "}}
+        assert AT.receive(at, timeout: 20) == {:error, :timeout}
+        assert AT.session(channel, fn _ -> flunk("busy") end) == {:error, :busy}
+        assert AT.command(at, "AT") == {:error, :exchange_pending}
+        assert AT.send(at, <<27>>) == :ok
+        assert PTY.read(pty, 1) == <<27>>
+        :ok = PTY.write(pty, "OK\r\n")
+        assert AT.receive(at) == {:ok, {:response, ["OK"]}}
+      end,
+      timeout: 1_000
+    )
+
+    assert AT.session(channel, fn _ -> :clean end) == :clean
+  end
+
+  test "returning after a receive timeout or unacknowledged abort fences the channel", %{
+    channel: channel,
+    pty: pty
+  } do
+    AT.session(channel, fn at ->
+      assert AT.send(at, "AT\r") == :ok
+      assert PTY.read(pty, 3) == "AT\r"
+      assert AT.receive(at, timeout: 20) == {:error, :timeout}
+      assert AT.send(at, <<27>>) == :ok
+      assert PTY.read(pty, 1) == <<27>>
+      assert AT.receive(at, timeout: 20) == {:error, :timeout}
+    end)
+
+    assert AT.session(channel, fn _ -> flunk("fenced") end) == {:error, :desynchronized}
+  end
+
+  test "I/O failure still fences a session after a receive timeout", %{channel: channel, pty: pty} do
+    AT.session(channel, fn at ->
+      assert AT.send(at, "AT\r") == :ok
+      assert PTY.read(pty, 3) == "AT\r"
+      assert AT.receive(at, timeout: 20) == {:error, :timeout}
+      :ok = PTY.disconnect(pty)
+      assert {:error, reason} = AT.receive(at, timeout: 100)
+      refute reason == :timeout
+      assert AT.send(at, <<27>>) == {:error, :desynchronized}
+    end)
+  end
+
+  test "queued recovery cannot execute after its caller times out", %{channel: channel} do
+    assert AT.session(channel, &AT.send(&1, "AT\r")) == :ok
+    uart = :sys.get_state(channel).uart
+    :ok = :sys.suspend(channel)
+
+    try do
+      task = Task.async(fn -> Channel.recover(channel) end)
+      assert Task.await(task, 7_000) == {:error, :outcome_unknown}
+    after
+      :sys.resume(channel)
+    end
+
+    state = :sys.get_state(channel)
+    assert state.uart == uart
+    assert state.blocked
+  end
+
+  test "temporary unlinked channels stop when their owner exits", %{pty: pty} do
+    parent = self()
+    :ok = stop_supervised(Channel)
+
+    {owner, owner_monitor} =
+      spawn_monitor(fn ->
+        {:ok, channel} = GenServer.start(Channel, tty: PTY.tty(pty), owner: self())
+        send(parent, {:temporary_channel, channel})
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert_receive {:temporary_channel, channel}
+    monitor = Process.monitor(channel)
+    send(owner, :stop)
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :normal}
+    assert_receive {:DOWN, ^monitor, :process, ^channel, :normal}
   end
 
   test "status diagnostics redact requests and payloads" do
