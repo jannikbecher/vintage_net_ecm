@@ -15,9 +15,12 @@ defmodule VintageNetECM.ATController do
 
   Every operation leases the same channel as application sessions. Busy or
   unavailable channels defer polling without discarding controller state.
-  Unfinished sessions and I/O failures publish `mobile.recovery_required` and
-  pause AT work. The application must restore the modem's protocol state and
-  call `VintageNetECM.recover/1`; the controller then reruns initialization.
+  Unfinished exchanges publish `mobile.recovery_required` and pause normal AT
+  work. The channel recovers controller-owned failures itself, by consuming a late
+  final reply or crashing so the supervisor restarts it; the controller then reruns
+  initialization.
+  Application-owned failures are never adopted by the controller; those require
+  the application to restore the modem and call `VintageNetECM.recover/1`.
   External managed sessions are admitted only after radio initialization.
 
   Vendor-specific commands belong to `VintageNetECM.Modem`. Teardown runs after
@@ -97,8 +100,6 @@ defmodule VintageNetECM.ATController do
     state = %{
       ifname: Keyword.fetch!(opts, :ifname),
       channel: Keyword.fetch!(opts, :channel),
-      channel_pid: nil,
-      channel_monitor: nil,
       ready: false,
       recovery_required: VintageNet.get(property, false),
       generation: make_ref(),
@@ -117,11 +118,11 @@ defmodule VintageNetECM.ATController do
     do: {:noreply, state}
 
   def handle_continue(:initialize, state) do
-    state = watch_channel(%{state | generation: make_ref()})
+    state = %{state | generation: make_ref()}
 
     result =
-      AT.session(
-        state.channel_pid,
+      AT.Channel.controller_session(
+        state.channel,
         fn at ->
           state = %{state | at: at}
 
@@ -129,11 +130,11 @@ defmodule VintageNetECM.ATController do
             {:initialized, refresh_static_properties(state)}
           end
         end,
-        timeout: 120_000
+        timeout: 240_000
       )
 
     with {:initialized, initialized} <- result,
-         :ok <- AT.session(state.channel_pid, fn _ -> :ok end) do
+         :ok <- AT.Channel.controller_session(state.channel, fn _ -> :ok end, []) do
       send(self(), {:poll, initialized.generation, :check_registration})
       {:noreply, %{initialized | at: nil, ready: true}}
     else
@@ -160,13 +161,6 @@ defmodule VintageNetECM.ATController do
   def handle_info(:initialize, %{ready: true} = state), do: {:noreply, state}
   def handle_info(:initialize, state), do: {:noreply, state, {:continue, :initialize}}
 
-  def handle_info({:DOWN, monitor, :process, _, _}, %{channel_monitor: monitor} = state) do
-    send(self(), :initialize)
-
-    {:noreply,
-     %{state | ready: false, channel_pid: nil, channel_monitor: nil, generation: make_ref()}}
-  end
-
   def handle_info({:poll, generation, event}, %{generation: generation} = state),
     do: handle_info(event, state)
 
@@ -177,8 +171,8 @@ defmodule VintageNetECM.ATController do
 
   def handle_info(:check_registration, state) do
     result =
-      AT.session(
-        state.channel_pid,
+      AT.Channel.controller_session(
+        state.channel,
         fn at ->
           state = %{state | at: at}
 
@@ -201,8 +195,8 @@ defmodule VintageNetECM.ATController do
 
   def handle_info(:monitor, state) do
     result =
-      AT.session(
-        state.channel_pid,
+      AT.Channel.controller_session(
+        state.channel,
         fn at ->
           state = refresh_static_properties(%{state | at: at})
           publish(state)
@@ -231,10 +225,15 @@ defmodule VintageNetECM.ATController do
       do: {:reply, {:error, :desynchronized}, state}
 
   def handle_call(:channel, _from, state) do
+    # The supervisor restarts this controller after its channel, so the
+    # registered channel is always the one it initialized.
     result =
-      if state.ready and state.channel_pid == GenServer.whereis(state.channel),
-        do: {:ok, state.channel_pid},
-        else: {:error, :not_ready}
+      with true <- state.ready,
+           pid when is_pid(pid) <- GenServer.whereis(state.channel) do
+        {:ok, pid}
+      else
+        _ -> {:error, :not_ready}
+      end
 
     {:reply, result, state}
   end
@@ -243,7 +242,7 @@ defmodule VintageNetECM.ATController do
     do: {:reply, {:error, :not_ready}, state}
 
   def handle_call(:network_time, _from, state) do
-    result = AT.session(state.channel_pid, &network_time(state.modem, &1))
+    result = AT.Channel.controller_session(state.channel, &network_time(state.modem, &1), [])
     {:reply, result, state}
   end
 
@@ -259,34 +258,24 @@ defmodule VintageNetECM.ATController do
   defp schedule(state, event, delay),
     do: Process.send_after(self(), {:poll, state.generation, event}, delay)
 
-  defp watch_channel(state) do
-    pid = GenServer.whereis(state.channel)
-
-    if pid == state.channel_pid do
-      state
-    else
-      if state.channel_monitor, do: Process.demonitor(state.channel_monitor, [:flush])
-      %{state | channel_pid: pid, channel_monitor: if(pid, do: Process.monitor(pid))}
-    end
-  end
-
   defp configure_radio(state) do
     [
-      "ATQ0V1",
-      "ATE0",
-      "AT+CMEE=1",
-      "AT+CEREG=2",
-      "AT+CFUN=1",
+      {"ATQ0V1", 5_000},
+      {"ATE0", 5_000},
+      {"AT+CMEE=1", 5_000},
+      {"AT+CEREG=2", 5_000},
+      {"AT+CFUN=1", 15_000},
       # Standard NITZ first; Quectel's 3 also updates the RTC used by CCLK.
-      "AT+CTZU=1",
-      "AT+CTZU=3",
-      ~s(AT+CGDCONT=#{state.context_id},"IP","#{state.apn}"),
-      "AT+COPS=0"
+      {"AT+CTZU=1", 5_000},
+      {"AT+CTZU=3", 5_000},
+      {~s(AT+CGDCONT=#{state.context_id},"IP","#{state.apn}"), 5_000},
+      {"AT+COPS=0", 180_000}
     ]
-    |> Enum.reduce_while(:ok, fn cmd, :ok ->
-      case AT.command(state.at, cmd, timeout: 5_000) do
+    |> Enum.reduce_while(:ok, fn {cmd, timeout}, :ok ->
+      case AT.command(state.at, cmd, timeout: timeout) do
         {:ok, _} -> {:cont, :ok}
-        {:error, reason} when reason == :error or is_tuple(reason) -> {:cont, :ok}
+        {:error, :error} -> {:cont, :ok}
+        {:error, {kind, _}} when kind in [:cme, :cms] -> {:cont, :ok}
         error -> {:halt, error}
       end
     end)

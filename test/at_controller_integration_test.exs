@@ -48,6 +48,27 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
     refute_received {VintageNet, ^property, _, true, _}
   end
 
+  test "an application receive does not block background polling or controller calls", context do
+    task =
+      Task.async(fn ->
+        VintageNetECM.session(context.ifname, fn at ->
+          :ok = AT.send(at, "AT+SLOW\r")
+          AT.receive(at, timeout: 2_000)
+        end)
+      end)
+
+    assert_receive {:at_command, "AT+SLOW"}
+    started = System.monotonic_time(:millisecond)
+    send(context.controller, :monitor)
+    assert :sys.get_state(context.controller, 500).ready
+    assert ATController.channel(context.ifname) == {:ok, context.channel}
+    assert System.monotonic_time(:millisecond) - started < 500
+    refute_received {:at_command, _}
+    :ok = PTY.write(context.pty, "OK\r\n")
+    assert Task.await(task) == {:ok, {:response, ["OK"]}}
+    assert VintageNet.get(["interface", context.ifname, "mobile", "recovery_required"]) == false
+  end
+
   test "temporary fencing preserves modem state and explicit recovery restores polling",
        context do
     before = :sys.get_state(context.controller)
@@ -60,41 +81,40 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
     assert VintageNetECM.command(context.ifname, "AT+CGMI") == {:ok, ["PTY modem"]}
   end
 
-  test "channel replacement reruns initialization before managed admission", context do
-    old_state = :sys.get_state(context.controller)
-    assert ATController.channel(context.ifname) == {:ok, context.channel}
-    :ok = stop_supervised(AT.Channel)
-    assert AT.session(context.channel, fn _ -> flunk("old channel") end) == {:error, :not_running}
+  test "a channel crash restarts and reinitializes the controller (rest_for_one)" do
+    ifname = "rfo#{System.unique_integer([:positive])}"
+    pty = start_supervised!({PTY, responder: &response/1, observer: self()}, id: :rfo_pty)
+    name = VintageNetECM.channel_name(ifname)
+    on_exit(fn -> PropertyTable.delete_matches(VintageNet, ["interface", ifname, "mobile"]) end)
 
-    assert VintageNetECM.session(context.ifname, fn _ -> flunk("not ready") end) ==
-             {:error, :not_ready}
+    children = [
+      {AT.Channel, tty: PTY.tty(pty), name: name, ifname: ifname},
+      {ATController, ifname: ifname, channel: name, apn: "test"}
+    ]
 
-    channel =
-      start_supervised!(
-        {AT.Channel,
-         tty: PTY.tty(context.pty),
-         name: VintageNetECM.channel_name(context.ifname),
-         ifname: context.ifname}
-      )
+    sup =
+      start_supervised!(%{
+        id: :rfo,
+        type: :supervisor,
+        start: {Supervisor, :start_link, [children, [strategy: :rest_for_one]]}
+      })
 
-    send(context.controller, :initialize)
-    state = :sys.get_state(context.controller)
-    assert state.ready
-    assert state.channel_pid == channel
-    assert state.static == old_state.static
-    assert VintageNetECM.command(context.ifname, "AT") == {:ok, []}
-    assert_receive {:at_command, "ATQ0V1"}
-    :sys.get_state(context.controller)
+    [{ATController, controller, _, _}, {AT.Channel, channel, _, _}] =
+      Supervisor.which_children(sup)
+
+    await_ready(controller)
     flush_commands()
 
-    send(context.controller, {:poll, old_state.generation, :monitor})
-    send(context.controller, {:poll, old_state.generation, :check_registration})
-    :sys.get_state(context.controller)
-    refute_received {:at_command, _}
+    Process.exit(channel, :kill)
+    assert_receive {:at_command, "ATQ0V1"}, 1_000
 
-    send(context.controller, {:poll, state.generation, :monitor})
-    :sys.get_state(context.controller)
-    assert_receive {:at_command, "AT+CEREG?"}
+    [{ATController, new_controller, _, _}, {AT.Channel, new_channel, _, _}] =
+      Supervisor.which_children(sup)
+
+    assert new_controller != controller and new_channel != channel
+    await_ready(new_controller)
+    assert ATController.channel(ifname) == {:ok, new_channel}
+    assert VintageNetECM.command(ifname, "AT") == {:ok, []}
   end
 
   test "teardown cannot steal a live tty and uses a supervised channel after shutdown", context do
@@ -122,6 +142,10 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
     assert VintageNetECM.command(context.ifname, "AT+SLOW", timeout: 30) == {:error, :timeout}
     assert_receive {:at_command, "AT+SLOW"}
     assert {:recovery_required, _} = :sys.get_state(context.channel)
+
+    assert VintageNet.get(["interface", context.ifname, "mobile", "recovery_owner"]) ==
+             :application
+
     :ok = PTY.write(context.pty, "OK\r\n")
 
     send(context.controller, :monitor)
@@ -131,7 +155,7 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
     assert VintageNetECM.command(context.ifname, "AT") == {:error, :desynchronized}
   end
 
-  test "background timeout reports recovery required and pauses until explicit recovery",
+  test "background timeout pauses polling and recovers automatically on late completion",
        context do
     property = ["interface", context.ifname, "mobile", "recovery_required"]
     assert VintageNet.get(property) == false
@@ -152,6 +176,10 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
     assert_receive {VintageNet, ^property, false, true, _}, 5_000
     state = :sys.get_state(context.controller)
     assert state.recovery_required
+
+    assert VintageNet.get(["interface", context.ifname, "mobile", "recovery_owner"]) ==
+             :controller
+
     refute state.ready
     assert state.generation != generation
     flush_commands()
@@ -167,14 +195,14 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
     # The simulated modem finishes the old command. Recovery never resends it.
     :sys.replace_state(context.pty, &%{&1 | responder: fn cmd -> response(cmd) end})
     :ok = PTY.write(context.pty, "OK\r\n")
-    assert VintageNetECM.recover(context.ifname) == :ok
-    assert_receive {VintageNet, ^property, true, false, _}
+    assert_receive {VintageNet, ^property, true, false, _}, 5_000
+    assert VintageNet.get(["interface", context.ifname, "mobile", "recovery_owner"]) == nil
     await_ready(context.controller)
     assert_receive {:at_command, "ATQ0V1"}
     assert VintageNetECM.command(context.ifname, "AT") == {:ok, []}
   end
 
-  test "initialization failure is visible before managed sessions are ready" do
+  test "initialization resumes after a late reply without application recovery" do
     ifname = "init#{System.unique_integer([:positive])}"
     property = ["interface", ifname, "mobile", "recovery_required"]
     :ok = VintageNet.subscribe(property)
@@ -183,7 +211,7 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
       start_supervised!(
         {PTY,
          responder: fn
-           "AT+CFUN=1" -> ""
+           "ATE0" -> ""
            command -> response(command)
          end},
         id: :init_pty
@@ -208,17 +236,36 @@ defmodule VintageNetECM.ATControllerIntegrationTest do
 
     :sys.replace_state(pty, &%{&1 | responder: fn cmd -> response(cmd) end})
     :ok = PTY.write(pty, "OK\r\n")
-    assert VintageNetECM.recover(ifname) == :ok
-    assert_receive {VintageNet, ^property, true, false, _}
+    assert_receive {VintageNet, ^property, true, false, _}, 5_000
     await_ready(controller)
   end
 
-  test "failed recovery keeps the flag set", context do
+  test "controller-owned UART loss restarts the channel without application involvement",
+       context do
+    property = ["interface", context.ifname, "mobile", "recovery_required"]
+    ref = Process.monitor(context.channel)
+    {_, %{uart: uart}} = :sys.get_state(context.channel)
+    Process.exit(uart, :kill)
+    assert_receive {:DOWN, ^ref, :process, _, {:controller_failure, _}}
+    await_ready(context.controller, 500)
+    assert VintageNet.get(property) == false
+    assert VintageNetECM.command(context.ifname, "AT") == {:ok, []}
+  end
+
+  test "application-owned I/O failure keeps the flag set until recovery", context do
     property = ["interface", context.ifname, "mobile", "recovery_required"]
     :ok = VintageNet.subscribe(property)
-    :ok = PTY.disconnect(context.pty)
-    assert {:error, _} = VintageNetECM.command(context.ifname, "AT")
+
+    VintageNetECM.session(context.ifname, fn at ->
+      :ok = PTY.disconnect(context.pty)
+      assert {:error, _} = AT.command(at, "AT")
+    end)
+
     assert_receive {VintageNet, ^property, false, true, _}
+
+    assert VintageNet.get(["interface", context.ifname, "mobile", "recovery_owner"]) ==
+             :application
+
     assert {:error, _} = VintageNetECM.recover(context.ifname)
     assert VintageNet.get(property) == true
     assert :sys.get_state(context.controller).recovery_required

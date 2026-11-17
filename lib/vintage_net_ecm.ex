@@ -106,7 +106,7 @@ defmodule VintageNetECM do
       base
       | type: __MODULE__,
         source_config: config,
-        child_specs: base.child_specs ++ [channel, controller],
+        child_specs: base.child_specs ++ [at_supervisor(ifname, channel, controller)],
         # VintageNet stops the children before running down_cmds.
         down_cmds:
           [
@@ -114,6 +114,16 @@ defmodule VintageNetECM do
              [modem, at_tty, context_id]},
             {:fun, PropertyTable, :delete_matches, [VintageNet, ["interface", ifname, "mobile"]]}
           ] ++ base.down_cmds
+    }
+  end
+
+  # A channel crash restarts only the controller, never the Ethernet/DHCP children,
+  # so existing IP connectivity survives AT recovery.
+  defp at_supervisor(ifname, channel, controller) do
+    %{
+      id: {__MODULE__, ifname},
+      type: :supervisor,
+      start: {Supervisor, :start_link, [[channel, controller], [strategy: :rest_for_one]]}
     }
   end
 
@@ -127,8 +137,10 @@ defmodule VintageNetECM do
   A fenced channel publishes `true` at
   `["interface", ifname, "mobile", "recovery_required"]`. Subscribe with
   `VintageNet.subscribe/1` to be notified, and read with `VintageNet.get/1`.
-  Background AT work pauses until recovery; existing IP connectivity is not
-  deliberately torn down.
+  The sibling `"recovery_owner"` property is `:application` or `:controller`.
+  The controller handles its own failures; call this function for an
+  application-owned failure only after restoring the modem. Existing IP
+  connectivity is not deliberately torn down.
 
   This call only reopens the UART and discards stale input. It does not abort a
   command, reset the modem, or establish that an uncertain SMS was not sent.
@@ -181,7 +193,8 @@ defmodule VintageNetECM do
   The callback runs in the calling PID. Its result is preserved, exceptions
   propagate, and handles cannot be transferred or reused. `:timeout` bounds all
   channel access, not arbitrary callback code. Failed or incomplete exchanges
-  fence traffic; recovery must be explicit and uncertain writes are never retried.
+  fence traffic; application-owned recovery must be explicit and uncertain
+  application writes are never retried.
   See `VintageNetECM.AT.session/3` and `VintageNetECM.AT.Channel`.
 
   Standalone applications supervise `VintageNetECM.AT.Channel` directly; no

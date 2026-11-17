@@ -82,9 +82,9 @@ defmodule VintageNetECM.AT do
     with {:ok, deadline} <- deadline(opts, session.deadline) do
       session = %{session | deadline: deadline}
 
-      with :ok <- Channel.exchange(session, :drain, opts),
+      with :ok <- Channel.exchange(session, {:begin_command, command_finals(cmd)}, opts),
            :ok <- send(session, cmd <> "\r", opts),
-           {:ok, event} <- Channel.exchange(session, {:receive, command_finals(cmd)}, opts) do
+           {:ok, event} <- __MODULE__.receive(session, opts) do
         command_result(event)
       end
     end

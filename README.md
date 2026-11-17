@@ -190,8 +190,9 @@ For a modem managed by VintageNet, configure `:intermediate_responses` and call
 `VintageNetECM.session("usb1", callback, opts)` instead. Radio initialization
 finishes before managed sessions are admitted. Polling leases the same channel
 and defers while an application session owns it. Competing sessions return
-`{:error, :busy}`; requests may wait behind an in-progress, deadline-bounded UART
-read. Do not create a second channel for its tty or an alias of that tty.
+`{:error, :busy}`. UART reads are asynchronous: a pending receive does not hold
+up the channel's other callers or background acquisition attempts. Do not create
+a second channel for its tty or an alias of that tty.
 
 Markers are exact byte sequences, including spaces and line endings (at most 32
 unambiguous markers of 1–128 bytes). A `:response` includes the final result, even
@@ -234,12 +235,13 @@ failures fence further traffic with `{:error, :desynchronized}`. Lost calls retu
 After explicitly recovering the modem's protocol state, call
 `VintageNetECM.AT.Channel.recover(channel)` to reopen the UART and discard stale
 input. Reopening or restarting a supervisor is not itself modem recovery, does
-not cancel pending modem operations, and must not be used as an automatic retry.
+not cancel pending modem operations, and must not be used as an automatic retry
+of application conversations.
 Initial tty-open failures retry without sending commands; failures after an
 exchange has begun require completion/cancellation within the session or explicit
 recovery afterwards. See `VintageNetECM.AT` for the full session contract.
 
-### Application-owned recovery
+### Recovery ownership
 
 For a managed interface, the channel publishes a boolean property:
 
@@ -251,13 +253,13 @@ VintageNet.get(property)
 ```
 
 Subscribe first, then read the current value so you also notice an existing
-failure. `true` means AT work is blocked and the application needs to recover
-its modem. This includes failures during radio initialization, background polls,
-and application sessions. The controller pauses AT work instead of repeatedly
-trying the blocked channel. It does not deliberately tear down IP connectivity.
+failure. `true` means normal AT work is blocked. The sibling `"recovery_owner"`
+property identifies `:application` or `:controller` (and is `nil` when clear).
+The controller pauses normal polling rather than mixing another command into an
+unfinished exchange. Existing IP connectivity is not deliberately torn down.
 
-Restore the modem's protocol state using a procedure appropriate for your modem
-and application, then call:
+For an **application-owned** failure, restore the modem's protocol state using
+a procedure appropriate for your modem and conversation, then call:
 
 ```elixir
 VintageNetECM.recover("usb1")
@@ -271,6 +273,26 @@ completed. Failed recovery leaves the flag set; an active session returns
 application command is performed. Your application decides whether and when to
 attempt recovery. A `false` flag only means recovery is not currently required;
 it does not indicate network readiness.
+
+For a **controller-owned** failure, the channel watches for the outstanding
+command's final response for a 30-second grace period.
+It consumes the late response without sending a probe or replaying the failed
+command. Once synchronized, it reruns initialization. Slow startup commands have
+longer deadlines: 180 seconds for operator selection and 15 seconds for radio
+activation.
+
+If the final response never arrives, or the UART fails during controller work,
+the channel crashes. Its supervisor restarts the channel, which reopens the UART
+and discards stale input, and then the controller, which reruns initialization.
+This is safe because controller commands are fixed and repeatable; none opens a
+prompt or data mode. The Ethernet and DHCP children are not restarted. If the
+modem itself keeps failing, repeated crashes exceed the supervisor's restart
+intensity and VintageNet restarts the whole interface. No application call to
+`VintageNetECM.recover/1` is ever needed for controller-owned failures.
+
+Application-owned failures are never recovered automatically: an application
+conversation may have left the modem mid-SMS or in data mode, which reopening
+cannot undo.
 
 Internally, the channel is an OTP `:gen_statem` with five states: unavailable,
 idle, leased, awaiting response, and recovery required. The public session API

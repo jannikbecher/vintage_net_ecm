@@ -127,7 +127,8 @@ defmodule VintageNetECMTest do
       assert [
                {VintageNetECM.AT.Channel, channel_opts},
                {VintageNetECM.ATController, controller_opts}
-             ] = Enum.take(raw.child_specs, -2)
+             ] =
+               at_children(raw)
 
       assert channel_opts[:tty] == "ttyUSB2"
       assert channel_opts[:name] == VintageNetECM.channel_name("usb1")
@@ -142,7 +143,7 @@ defmodule VintageNetECMTest do
     test "passes configured intermediate markers to the channel" do
       config = base_config(%{intermediate_responses: ["> "]})
       raw = VintageNetECM.to_raw_config("usb1", config, Application.get_all_env(:vintage_net))
-      {VintageNetECM.AT.Channel, options} = Enum.at(raw.child_specs, -2)
+      [{VintageNetECM.AT.Channel, options}, _] = at_children(raw)
       assert options[:intermediate_responses] == ["> "]
     end
 
@@ -165,5 +166,12 @@ defmodule VintageNetECMTest do
     test "check_system passes" do
       assert VintageNetECM.check_system([]) == :ok
     end
+  end
+
+  defp at_children(raw) do
+    %{start: {Supervisor, :start_link, [children, [strategy: :rest_for_one]]}} =
+      List.last(raw.child_specs)
+
+    children
   end
 end
